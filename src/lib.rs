@@ -8,6 +8,7 @@ use chacha20poly1305::{
 use futures::ready;
 use headers::{ETag, LastModified};
 use rand::{TryRngCore, rngs::OsRng};
+use sha2::{Digest, Sha256};
 use std::io::{self, SeekFrom};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -195,9 +196,8 @@ impl AsyncRead for DavFile {
                 let is_last = encrypted_read_buffer.len() < ENCRYPTED_CHUNK_SIZE;
 
                 //// FOR TEST PURPOSE ONLY ////
-                let fp = encrypted_read_buffer
-                    .iter()
-                    .fold(0u64, |acc, &b| acc.wrapping_mul(131).wrapping_add(b as u64));
+                let hash = Sha256::digest(&encrypted_read_buffer);
+                let fp = hash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
                 eprintln!(
                     "READ chunk_idx={} len={} fp={} is_last={is_last} pos={pos}",
@@ -440,9 +440,8 @@ fn poll_write_chunks(
             })?;
 
         //// FOR TEST PURPOSE ONLY ////
-        let fp = ciphertext
-            .iter()
-            .fold(0u64, |acc, &b| acc.wrapping_mul(131).wrapping_add(b as u64));
+        let hash = Sha256::digest(&ciphertext);
+        let fp = hash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
         eprintln!(
             "WROTE chunk_idx={} len={} fp={}",
             *write_chunk_idx,
