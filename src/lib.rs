@@ -197,7 +197,10 @@ impl AsyncRead for DavFile {
 
                 //// FOR TEST PURPOSE ONLY ////
                 let hash = Sha256::digest(&encrypted_read_buffer);
-                let fp = hash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                let fp = hash
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>();
 
                 eprintln!(
                     "READ chunk_idx={} len={} fp={} is_last={is_last} pos={pos}",
@@ -431,17 +434,20 @@ fn poll_write_chunks(
     while write_buffer.len() >= PLAIN_CHUNK_SIZE || (finalize && !write_buffer.is_empty()) {
         let is_last = finalize && write_buffer.len() <= PLAIN_CHUNK_SIZE;
         let chunk_len = std::cmp::min(write_buffer.len(), PLAIN_CHUNK_SIZE);
-        let chunk = write_buffer.drain(..chunk_len).collect::<Vec<_>>();
+        let chunk = &write_buffer[..chunk_len];
 
         let ciphertext = stream_encryptor
-            .encrypt(*write_chunk_idx, is_last, chunk.as_slice())
+            .encrypt(*write_chunk_idx, is_last, chunk)
             .map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("Encryption error: {}", e))
             })?;
 
         //// FOR TEST PURPOSE ONLY ////
         let hash = Sha256::digest(&ciphertext);
-        let fp = hash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let fp = hash
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
         eprintln!(
             "WROTE chunk_idx={} len={} fp={}",
             *write_chunk_idx,
@@ -449,8 +455,6 @@ fn poll_write_chunks(
             fp
         );
         ////
-
-        *write_chunk_idx += 1;
 
         // write the ciphertext fully to disk
         let mut written = 0;
@@ -465,6 +469,8 @@ fn poll_write_chunks(
             }
             written += bytes_written;
         }
+        write_buffer.drain(..chunk_len);
+        *write_chunk_idx += 1;
     }
     Poll::Ready(Ok(()))
 }
