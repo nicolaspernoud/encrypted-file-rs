@@ -8,7 +8,6 @@ use chacha20poly1305::{
 use futures::ready;
 use headers::{ETag, LastModified};
 use rand::{TryRngCore, rngs::OsRng};
-use sha2::{Digest, Sha256};
 use std::io::{self, SeekFrom};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -22,10 +21,12 @@ const ENCRYPTED_CHUNK_SIZE: usize = PLAIN_CHUNK_SIZE + ENCRYPTION_OVERHEAD;
 // Using stream::StreamBE32 with XChaCha20Poly1305 does take a 19-byte nonce prefix and internally composes a 24-byte XChaCha nonce with a 32-bit big-endian counter.
 const NONCE_SIZE: usize = 19;
 
+const BUFFER_ERROR: &str = "buffer error for encryption or decryption";
+
 pub enum DavFile {
     Plain(File),
     Encrypted {
-        file: File,
+        file: Box<File>,
         key: [u8; 32],
         read_buffer: Vec<u8>,
         encrypted_read_buffer: Vec<u8>,
@@ -38,6 +39,7 @@ pub enum DavFile {
         write_chunk_idx: u32,
         seeked_after_open: bool,
         stream_encryptor: StreamBE32<XChaCha20Poly1305>,
+        write_op_in_progress: bool,
     },
 }
 
@@ -49,13 +51,13 @@ impl DavFile {
             Some(key) => {
                 let mut nonce = [0u8; NONCE_SIZE];
                 TryRngCore::try_fill_bytes(&mut OsRng, &mut nonce)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
                 file.write_all(&nonce).await?;
                 file.flush().await?;
                 let aead = XChaCha20Poly1305::new(key.as_ref().into());
                 let stream_encryptor = stream::StreamBE32::from_aead(aead, nonce.as_ref().into());
                 Ok(DavFile::Encrypted {
-                    file,
+                    file: Box::new(file),
                     key,
                     read_buffer: Vec::new(),
                     encrypted_read_buffer: Vec::new(),
@@ -68,6 +70,7 @@ impl DavFile {
                     write_chunk_idx: 0,
                     seeked_after_open: false,
                     stream_encryptor,
+                    write_op_in_progress: false,
                 })
             }
             None => Ok(DavFile::Plain(file)),
@@ -77,7 +80,7 @@ impl DavFile {
     pub async fn open(path: impl AsRef<Path>, key: Option<[u8; 32]>) -> io::Result<DavFile> {
         let mut file = fs::OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .open(&path)
             .await?;
         let metadata = file.metadata().await?;
@@ -93,19 +96,20 @@ impl DavFile {
                 let aead = XChaCha20Poly1305::new(key.as_ref().into());
                 let stream_encryptor = stream::StreamBE32::from_aead(aead, nonce.as_ref().into());
                 Ok(DavFile::Encrypted {
-                    file,
+                    file: Box::new(file),
                     key,
                     read_buffer: Vec::new(),
                     encrypted_read_buffer: Vec::new(),
                     write_buffer: Vec::new(),
                     pos: 0,
                     decrypted_len: decrypted_size(metadata.len()),
-                    nonce: nonce,
+                    nonce,
                     offset_in_chunk: 0,
                     read_chunk_idx: 0,
                     write_chunk_idx: write_chunk_idx_initial,
                     seeked_after_open: false,
                     stream_encryptor,
+                    write_op_in_progress: false,
                 })
             }
             None => Ok(DavFile::Plain(file)),
@@ -117,6 +121,10 @@ impl DavFile {
             DavFile::Plain(file) => file.metadata().await.map_or(0, |m| m.len()),
             DavFile::Encrypted { decrypted_len, .. } => *decrypted_len,
         }
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
     }
 
     pub async fn cache_headers(&self) -> Option<(ETag, LastModified)> {
@@ -163,7 +171,11 @@ impl AsyncRead for DavFile {
                 // first, return any leftover plaintext
                 if !read_buffer.is_empty() {
                     let len = std::cmp::min(buf.remaining(), read_buffer.len());
-                    buf.put_slice(&read_buffer[..len]);
+                    buf.put_slice(
+                        read_buffer
+                            .get(..len)
+                            .ok_or(io::Error::other(BUFFER_ERROR))?,
+                    );
                     read_buffer.drain(..len);
                     *pos += len as u64;
                     return Poll::Ready(Ok(()));
@@ -179,10 +191,11 @@ impl AsyncRead for DavFile {
                             if n == 0 {
                                 break; // EOF
                             }
-                            encrypted_read_buffer.extend_from_slice(&tmp[..n]);
+                            encrypted_read_buffer.extend_from_slice(
+                                tmp.get(..n).ok_or(io::Error::other(BUFFER_ERROR))?,
+                            );
                         }
                         Poll::Ready(Err(e)) => {
-                            eprintln!("ERROR = {e:?}");
                             return Poll::Ready(Err(e));
                         }
                         Poll::Pending => return Poll::Pending,
@@ -195,7 +208,8 @@ impl AsyncRead for DavFile {
 
                 let is_last = encrypted_read_buffer.len() < ENCRYPTED_CHUNK_SIZE;
 
-                //// FOR TEST PURPOSE ONLY ////
+                /*
+                /// FOR TEST PURPOSE ONLY ////
                 let hash = Sha256::digest(&encrypted_read_buffer);
                 let fp = hash
                     .iter()
@@ -209,6 +223,7 @@ impl AsyncRead for DavFile {
                     fp
                 );
                 ////
+                */
 
                 let mut plaintext = stream_encryptor
                     .decrypt(
@@ -216,9 +231,7 @@ impl AsyncRead for DavFile {
                         is_last,
                         encrypted_read_buffer.as_slice(),
                     )
-                    .map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("Decryption error: {e}"))
-                    })?;
+                    .map_err(|e| io::Error::other(format!("Decryption error: {e}")))?;
 
                 encrypted_read_buffer.clear();
                 *read_chunk_idx += 1;
@@ -236,9 +249,11 @@ impl AsyncRead for DavFile {
 
                 // fill the user buffer and keep remainder in read_buffer
                 let len = std::cmp::min(buf.remaining(), plaintext.len());
-                buf.put_slice(&plaintext[..len]);
+                buf.put_slice(plaintext.get(..len).ok_or(io::Error::other(BUFFER_ERROR))?);
                 if len < plaintext.len() {
-                    read_buffer.extend_from_slice(&plaintext[len..]);
+                    read_buffer.extend_from_slice(
+                        plaintext.get(len..).ok_or(io::Error::other(BUFFER_ERROR))?,
+                    );
                 }
                 *pos += len as u64;
 
@@ -263,6 +278,7 @@ impl AsyncWrite for DavFile {
                 write_chunk_idx,
                 seeked_after_open,
                 stream_encryptor,
+                write_op_in_progress,
                 ..
             } => {
                 if *seeked_after_open {
@@ -271,19 +287,32 @@ impl AsyncWrite for DavFile {
                         "writing after seek is not supported for encrypted files",
                     )));
                 }
-                write_buffer.extend_from_slice(buf);
-                *decrypted_len += buf.len() as u64;
 
-                ready!(poll_write_chunks(
+                if !*write_op_in_progress {
+                    write_buffer.extend_from_slice(buf);
+                    *decrypted_len += buf.len() as u64;
+                }
+
+                *write_op_in_progress = true;
+
+                match poll_write_chunks(
                     cx,
                     file,
                     write_buffer,
                     write_chunk_idx,
                     stream_encryptor,
-                    false
-                ))?;
-
-                Poll::Ready(Ok(buf.len()))
+                    false,
+                ) {
+                    Poll::Ready(Ok(())) => {
+                        *write_op_in_progress = false;
+                        Poll::Ready(Ok(buf.len()))
+                    }
+                    Poll::Ready(Err(e)) => {
+                        *write_op_in_progress = false;
+                        Poll::Ready(Err(e))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
             }
         }
     }
@@ -413,8 +442,7 @@ pub fn decrypted_size(enc_size: u64) -> u64 {
         return 0;
     }
     let enc_size_without_nonce = enc_size - NONCE_SIZE as u64;
-    let num_chunks =
-        (enc_size_without_nonce + ENCRYPTED_CHUNK_SIZE as u64 - 1) / ENCRYPTED_CHUNK_SIZE as u64;
+    let num_chunks = enc_size_without_nonce.div_ceil(ENCRYPTED_CHUNK_SIZE as u64);
     if num_chunks == 0 {
         return 0;
     }
@@ -434,14 +462,15 @@ fn poll_write_chunks(
     while write_buffer.len() >= PLAIN_CHUNK_SIZE || (finalize && !write_buffer.is_empty()) {
         let is_last = finalize && write_buffer.len() <= PLAIN_CHUNK_SIZE;
         let chunk_len = std::cmp::min(write_buffer.len(), PLAIN_CHUNK_SIZE);
-        let chunk = &write_buffer[..chunk_len];
+        let chunk = write_buffer
+            .get(..chunk_len)
+            .ok_or(io::Error::other(BUFFER_ERROR))?;
 
         let ciphertext = stream_encryptor
             .encrypt(*write_chunk_idx, is_last, chunk)
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("Encryption error: {}", e))
-            })?;
+            .map_err(|e| io::Error::other(format!("Encryption error: {}", e)))?;
 
+        /*
         //// FOR TEST PURPOSE ONLY ////
         let hash = Sha256::digest(&ciphertext);
         let fp = hash
@@ -455,12 +484,19 @@ fn poll_write_chunks(
             fp
         );
         ////
+        */
 
         // write the ciphertext fully to disk
         let mut written = 0;
         while written < ciphertext.len() {
-            let bytes_written =
-                ready!(Pin::new(&mut *file).poll_write(cx, &ciphertext[written..]))?;
+            let bytes_written = ready!(
+                Pin::new(&mut *file).poll_write(
+                    cx,
+                    ciphertext
+                        .get(written..)
+                        .ok_or(io::Error::other(BUFFER_ERROR))?
+                )
+            )?;
             if bytes_written == 0 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::WriteZero,
