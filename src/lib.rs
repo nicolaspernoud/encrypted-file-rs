@@ -34,8 +34,8 @@ pub enum DavFile {
         pos: u64,
         decrypted_len: u64,
         nonce: [u8; NONCE_SIZE],
-        offset_in_chunk: u64,
-        read_chunk_idx: u64,
+        offset_in_chunk: u32,
+        read_chunk_idx: u32,
         write_chunk_idx: u32,
         seeked_after_open: bool,
         stream_encryptor: StreamBE32<XChaCha20Poly1305>,
@@ -226,11 +226,7 @@ impl AsyncRead for DavFile {
                 */
 
                 let mut plaintext = stream_encryptor
-                    .decrypt(
-                        *read_chunk_idx as u32,
-                        is_last,
-                        encrypted_read_buffer.as_slice(),
-                    )
+                    .decrypt(*read_chunk_idx, is_last, encrypted_read_buffer.as_slice())
                     .map_err(|e| io::Error::other(format!("Decryption error: {e}")))?;
 
                 encrypted_read_buffer.clear();
@@ -414,8 +410,8 @@ impl AsyncSeek for DavFile {
                 encrypted_read_buffer.clear();
 
                 let encrypted_pos = encrypted_chunk_start(*pos);
-                *offset_in_chunk = *pos % PLAIN_CHUNK_SIZE as u64;
-                *read_chunk_idx = *pos / PLAIN_CHUNK_SIZE as u64;
+                *offset_in_chunk = *pos as u32 % PLAIN_CHUNK_SIZE as u32;
+                *read_chunk_idx = *pos as u32 / PLAIN_CHUNK_SIZE as u32;
                 Pin::new(file).start_seek(SeekFrom::Start(encrypted_pos))
             }
         }

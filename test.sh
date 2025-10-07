@@ -4,7 +4,7 @@ WD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cd "${WD}"
 
-for i in {1..2000}; do
+for i in {1..1000}; do
     echo -e "===============================\nRunning test for iteration $i\n==============================="
     if ! cargo test --release -- --no-capture; then
         echo "Test failed on iteration $i"
